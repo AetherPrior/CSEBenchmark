@@ -2,14 +2,13 @@ import os
 import sys
 import json
 import tqdm
-import openai
+from openai import OpenAI
 import argparse
 from string import Template
 from dotenv import load_dotenv
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 choice_number = 5
-temperature = 0.2
 
 scripts_dir = sys.path[0]
 project_dir = os.path.abspath(os.path.join(scripts_dir, ".."))
@@ -19,16 +18,17 @@ config_dir = os.path.join(project_dir, "config")
 
 load_dotenv(os.path.join(config_dir, ".env"))
 
-client = openai.OpenAI(
-    api_key=os.environ.get("OPENAI_API_KEY")
-)
 
 def generateAnswers(args):
-    question, model, prompt_type, correct_answer = args
+    key, question, model, prompt_type, temperature,correct_answer = args
 
+    client = OpenAI(
+        api_key=os.environ.get("OPENAI_API_KEY", ""),
+        base_url=os.environ.get("OPENAI_API_BASE_URL", "http://localhost:8000/v1"),
+    )
     if prompt_type == "few-shot":
         prompt_template = Template("""
-Here is a multipul choice question (with answers) about Computer and Security Knowledge.
+Here is a multiple choice question (with answers) about Computer and Security Knowledge.
 
 ## Instruction
 There is only one answer to the question, please return the result directly (A/B/C/D) without adding any other content.
@@ -71,7 +71,7 @@ C. 1880
 D. 1850
 
 ## Example output 4
-C
+B
 
 ## Example input 5
 Question: This is a question about Programming_Language_Levels. Which of the following is a machine-independent program?
@@ -91,7 +91,7 @@ Question: $question
 """)
     else:
         prompt_template = Template("""
-Here is a multipul choice question (with answers) about Computer and Security Knowledge.
+Here is a multiple choice question (with answers) about Computer and Security Knowledge.
 
 Question: $question
 
@@ -103,43 +103,60 @@ There is only one answer to the question, please return the result directly (A/B
     if prompt_type == "cot":
         prompt = prompt.replace("without adding any other content.", "at the end of your response. Let's think step by step.")
 
-    response = client.chat.completions.create(
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-        model=model,
-        temperature=temperature,
-        n=choice_number
-    )
+    def generate_response(_):
+        return client.responses.create(
+            model=model,
+            input=[
+                {"role": "user", "content": prompt}
+            ],
+            temperature=temperature,
+            reasoning={"effort": "high"}
+        )
+
+    choice_number = 5  # for example
+    responses = []
+    # breakpoint()
+
+    with ThreadPoolExecutor(max_workers=choice_number) as executor:
+        futures = [executor.submit(generate_response, i) for i in range(choice_number)]
+        for future in as_completed(futures):
+            responses.append(future.result())
 
     results = []
-    for res in response.choices:
+    for res in  responses: #response.choices:
         results.append({
             "model_name": model,
             "key_answer_type": "alphabet_option",
             "question": question,
-            "llm_output": res.message.content,
+            "key": key,
+            "llm_output": res.output[0].content[0].text,
             "correct_answer": correct_answer,
             "standard_answer_range": [[choice[:1], choice[3:]] for choice in question.split("\n")[1:]]
         })
     return results
 
+import random
 # Function to reformat questions
 def reformat_questions(json_data):
     reformatted_questions = []
+    correct_answer = "A"  # All answers are A in this dataset
+
     for key in json_data:
         for item in json_data[key]["questions"]:
             question_text = f'This is a question about {key.split(".")[-1].replace("_slash_", "/").replace("_", " ")}. {item["question"]}'
             choices = item['choices']
+            # choose a new correct answer
+            correct_answer = random.choice("ABCDEFGHI"[:len(choices)])
+            # swap the correct answer to the position of correct_answer A = 0, B=1, C=2, ...
+            correct_index = ord(correct_answer) - ord('A')
+            # swap choices[0] with choices[correct_index]
+            choices[0], choices[correct_index] = choices[correct_index], choices[0]
             reformatted_question = f"{question_text}"
             for i in range(len(choices)):
                 label = "ABCDEFGHI"[i]
                 reformatted_question += f"\n{label}. {choices[i]}"
             
-            reformatted_questions.append(reformatted_question)
+            reformatted_questions.append((key, correct_answer, reformatted_question))
     
     return reformatted_questions
 
@@ -148,28 +165,37 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Script to get answers from LLMs.")
     parser.add_argument('--model', type=str, required=True, help="Specify the model to use, e.g., gpt-3.5-turbo")
     parser.add_argument('--worker', type=int, required=True, help="Specify the max worker model to use")
+    parser.add_argument('--temperature', type=float, default=0.2, help="Temperature for the model generation")
 
     args = parser.parse_args()
     
     model = args.model
     num_worker = args.worker
+    temperature = args.temperature
 
-    for prompt_type in ["zero-shot", "few-shot", "cot"]:
-        for i in ["A", "B", "C", "D"]:
+    filter_keys = [
+        'Cyber_Security.Security_Skills_and_Knowledge',
+        'Cyber_Security.Networking_Knowledge',
+        'Cyber_Security.Web_Knowledge'
+    ]
+
+    for prompt_type in ["few-shot"]: # ["zero-shot"]: #  "few-shot", "cot"]:
+        for i in ["A"]:
             with open(os.path.join(questions_dir, f"csebench_{i}.json"), "r") as f:
                 json_data = json.loads(f.read())
-
+                # filter json_data to only keep keys in filter_keys with prefix as filter_keys
+                json_data = {k: v for k, v in json_data.items() if any(k.startswith(prefix) for prefix in filter_keys)}
             print(f"[*] Processing distribution {i} of {prompt_type} ...")
 
             reformatted_questions = reformat_questions(json_data)
 
             args_list = []
-            for question in reformatted_questions:
-                args_list.append((question, model, prompt_type, i))
+            for key, correct_answer, question in reformatted_questions:
+                args_list.append((key, question, model, prompt_type, temperature, correct_answer))
 
             results = []
 
-            with ProcessPoolExecutor(max_workers=num_worker) as executor:
+            with ThreadPoolExecutor(max_workers=num_worker) as executor:
                 results = list(tqdm.tqdm(executor.map(generateAnswers, args_list), total=len(args_list)))
 
             ret_results = []
